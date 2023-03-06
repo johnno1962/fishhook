@@ -21,7 +21,8 @@ let package = Package(
         .target(
             name: "fishhook",
             dependencies: [],
-            path: "./"),
+            path: "./",
+            cSettings: [.define("FISHHOOK_EXPORT")])
     ]
 )
 

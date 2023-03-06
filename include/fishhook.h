@@ -27,7 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if !defined(FISHHOOK_EXPORT) && 0
+#if !defined(FISHHOOK_EXPORT)
 #define FISHHOOK_VISIBILITY __attribute__((visibility("hidden")))
 #else
 #define FISHHOOK_VISIBILITY __attribute__((visibility("default")))
