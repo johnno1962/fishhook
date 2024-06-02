@@ -10,6 +10,9 @@ let package = Package(
         .library(
             name: "fishhook",
             targets: ["fishhook"]),
+        .library(
+            name: "fishhookD",
+            targets: ["fishhookD"]),
     ],
     dependencies: [
         // Dependencies declare other packages that this package depends on.
@@ -20,9 +23,10 @@ let package = Package(
         // Targets can depend on other targets in this package, and on products in packages which this package depends on.
         .target(
             name: "fishhook",
-            dependencies: [],
-            path: "./",
-            cSettings: [.define("FISHHOOK_EXPORT")])
+            cSettings: [.define("FISHHOOK_EXPORT")]),
+        .target(
+            name: "fishhookD",
+            cSettings: [.define("FISHHOOK_EXPORT"), .define("DEBUG_ONLY")])
     ]
 )
 
