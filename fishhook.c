@@ -22,7 +22,6 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #if DEBUG || !DEBUG_ONLY
-#if __has_include(<mach-o/dyld.h>)
 #include "fishhook.h"
 
 #include <dlfcn.h>
@@ -39,6 +38,8 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <stdio.h>
+
+// Modified to rebind to the value provided by dlsym for rebindings_nel == -1.
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -106,6 +107,21 @@ static vm_prot_t get_protection(void *sectionStart) {
     return VM_PROT_READ;
   }
 }
+
+// SwiftTrace additions here
+static STTracer stTracer;
+int rebind_symbols_trace(void * _Nonnull header,
+                         intptr_t slide,
+                         STTracer tracer) {
+    stTracer = tracer;
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wnonnull"
+    int rval = rebind_symbols_image(header, slide, NULL, -1);
+    #pragma clang diagnostic pop
+    stTracer = NULL;
+    return rval;
+}// SwiftTrace additions end
+
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
@@ -116,13 +132,15 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
   vm_prot_t oldProtection = VM_PROT_READ;
+  // iOS 27+ requires page aligned address
   uintptr_t page_mask = ~(PAGE_SIZE-1), aligned = (uintptr_t)indirect_symbol_bindings&page_mask,
     rounded = ((uintptr_t)indirect_symbol_bindings-aligned + section->size + PAGE_SIZE-1)&page_mask;
   if (isDataConst) {
     oldProtection = get_protection(rebindings);
-    if (mprotect((void *)aligned, rounded, PROT_READ | PROT_WRITE) != KERN_SUCCESS)
-      printf("fishhook: mprotect(%p, 0x%lx, 0x%x) failed: %s\n",
-             (void *)aligned, rounded, PROT_READ | PROT_WRITE, strerror(errno));
+    if (vm_protect(mach_task_self(), (void *)aligned, rounded, 0,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+      printf("fishhook: vm_protect(mach_task_self(), %p, 0x%lx, 0, 0x%x) failed: %s\n",
+             (void *)aligned, rounded, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, strerror(errno));
   }
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     uint32_t symtab_index = indirect_symbol_indices[i];
@@ -134,6 +152,27 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
     char *symbol_name = strtab + strtab_offset;
     bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
     struct rebindings_entry *cur = rebindings;
+    if (!cur) { // SwiftTrace additions here
+      void *value = !stTracer ? NULL :
+        stTracer(indirect_symbol_bindings[i], symbol_name+1);
+      if (value) {
+        indirect_symbol_bindings[i] = value;
+        continue;
+      }
+      void *fast_dlsym(const void *ptr, const char *symname);
+      value = dlsym(RTLD_DEFAULT, symbol_name+1) ?:
+        dlsym(RTLD_DEFAULT, symbol_name) ?:
+        fast_dlsym(section, symbol_name+1); // Symbol can be unhidden fileprivate
+      #if DEBUG && 01
+      if (!indirect_symbol_bindings[i] && !value &&
+          strcmp(symbol_name, "dyld_stub_binder") != 0)
+        printf("SwiftTrace: Cannot bind symbol %p %p %s %p\n",
+               section, indirect_symbol_bindings[i], symbol_name, value);
+      #endif
+      if (value)
+        indirect_symbol_bindings[i] = value;
+      continue;
+    } // SwiftTrace additions end
     while (cur) {
       for (uint j = 0; j < cur->rebindings_nel; j++) {
         if (symbol_name_longer_than_1 &&
@@ -263,5 +302,4 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
   }
   return retval;
 }
-#endif
 #endif
