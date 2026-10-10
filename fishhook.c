@@ -108,19 +108,39 @@ static vm_prot_t get_protection(void *sectionStart) {
   }
 }
 
-// SwiftTrace additions here
+// facebook/fishhook: mprotect() is refused for __DATA_CONST, so hand out a
+// private writable copy of the section with vm_protect()/VM_PROT_COPY instead,
+// right before each write. The caller must skip the write when this fails.
+// See: https://github.com/johnno1962/InjectionNext/issues/174
+static kern_return_t make_section_writable(section_t *section, void **indirect_symbol_bindings) {
+    // iOS 27+ requires page aligned address
+  uintptr_t page_mask = ~(PAGE_SIZE-1), aligned = (uintptr_t)indirect_symbol_bindings&page_mask,
+    rounded = ((uintptr_t)indirect_symbol_bindings-aligned + section->size + PAGE_SIZE-1)&page_mask;
+  kern_return_t err = vm_protect(mach_task_self(), aligned, rounded, 0,
+                                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+  #if DEBUG
+  if (err != KERN_SUCCESS)
+    printf("fishhook: vm_protect(mach_task_self(), %p, 0x%lx, 0, 0x%x) failed: %s\n",
+           (void *)indirect_symbol_bindings, (unsigned long)section->size,
+           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, strerror(err));
+  #endif
+  return err;
+}
+
+#if SWIFT_TRACE
 static STTracer stTracer;
 int rebind_symbols_trace(void * _Nonnull header,
                          intptr_t slide,
                          STTracer tracer) {
-    stTracer = tracer;
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wnonnull"
-    int rval = rebind_symbols_image(header, slide, NULL, -1);
-    #pragma clang diagnostic pop
-    stTracer = NULL;
-    return rval;
-}// SwiftTrace additions end
+  stTracer = tracer;
+  #pragma clang diagnostic push
+  #pragma clang diagnostic ignored "-Wnonnull"
+  int rval = rebind_symbols_image(header, slide, NULL, -1);
+  #pragma clang diagnostic pop
+  stTracer = NULL;
+  return rval;
+}
+#endif
 
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
@@ -131,17 +151,7 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
   const bool isDataConst = strcmp(section->segname, SEG_DATA_CONST) == 0;
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
-  vm_prot_t oldProtection = VM_PROT_READ;
-  // iOS 27+ requires page aligned address
-  uintptr_t page_mask = ~(PAGE_SIZE-1), aligned = (uintptr_t)indirect_symbol_bindings&page_mask,
-    rounded = ((uintptr_t)indirect_symbol_bindings-aligned + section->size + PAGE_SIZE-1)&page_mask;
-  if (isDataConst) {
-    oldProtection = get_protection(rebindings);
-    if (vm_protect(mach_task_self(), (void *)aligned, rounded, 0,
-                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
-      printf("fishhook: vm_protect(mach_task_self(), %p, 0x%lx, 0, 0x%x) failed: %s\n",
-             (void *)aligned, rounded, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, strerror(errno));
-  }
+  kern_return_t err = ~KERN_SUCCESS;
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     uint32_t symtab_index = indirect_symbol_indices[i];
     if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
@@ -152,15 +162,13 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
     char *symbol_name = strtab + strtab_offset;
     bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
     struct rebindings_entry *cur = rebindings;
-    if (!cur) { // SwiftTrace additions here
+
+#if SWIFT_TRACE
+    if (!cur) {
       void *value = !stTracer ? NULL :
         stTracer(indirect_symbol_bindings[i], symbol_name+1);
-      if (value) {
-        indirect_symbol_bindings[i] = value;
-        continue;
-      }
       void *fast_dlsym(const void *ptr, const char *symname);
-      value = dlsym(RTLD_DEFAULT, symbol_name+1) ?:
+      value = value ?: dlsym(RTLD_DEFAULT, symbol_name+1) ?:
         dlsym(RTLD_DEFAULT, symbol_name) ?:
         fast_dlsym(section, symbol_name+1); // Symbol can be unhidden fileprivate
       #if DEBUG && 01
@@ -169,38 +177,34 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         printf("SwiftTrace: Cannot bind symbol %p %p %s %p\n",
                section, indirect_symbol_bindings[i], symbol_name, value);
       #endif
-      if (value)
-        indirect_symbol_bindings[i] = value;
+      if (value) {
+        if (err != KERN_SUCCESS)
+          err = make_section_writable(section, indirect_symbol_bindings);
+        if (err == KERN_SUCCESS)
+          indirect_symbol_bindings[i] = value;
+      }
       continue;
-    } // SwiftTrace additions end
+    }
+#endif
     while (cur) {
       for (uint j = 0; j < cur->rebindings_nel; j++) {
         if (symbol_name_longer_than_1 &&
             strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
-          if (cur->rebindings[j].replaced != NULL &&
-              indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
-            *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
+          if (err != KERN_SUCCESS)
+            err = make_section_writable(section, indirect_symbol_bindings);
+          if (err == KERN_SUCCESS) {
+            void *before = indirect_symbol_bindings[i];
+            indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+            if (cur->rebindings[j].replaced != NULL &&
+                indirect_symbol_bindings[i] != before)
+              *(cur->rebindings[j].replaced) = before;
           }
-          indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
           goto symbol_loop;
         }
       }
       cur = cur->next;
     }
   symbol_loop:;
-  }
-  if (isDataConst) {
-    int protection = 0;
-    if (oldProtection & VM_PROT_READ) {
-      protection |= PROT_READ;
-    }
-    if (oldProtection & VM_PROT_WRITE) {
-      protection |= PROT_WRITE;
-    }
-    if (oldProtection & VM_PROT_EXECUTE) {
-      protection |= PROT_EXEC;
-    }
-    mprotect((void *)aligned, rounded, protection);
   }
 }
 
